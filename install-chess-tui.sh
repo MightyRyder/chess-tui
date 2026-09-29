@@ -16,6 +16,9 @@
 #                                     force a build variant (default: auto)
 #    NO_LAUNCH=1                      install only, don't start the game
 #    LICHESS_TOKEN=<token>            save a Lichess API token non-interactively
+#    CHESS_TUI_TOKEN_FILE=<path>      durable token file (default: $HOME/chess-tui-token,
+#                                     kept VISIBLE so ephemeral VM homes survive)
+#    CHESS_TUI_SKIP_TOKEN_CHECK=1     save without testing against the Lichess API
 # ============================================================================
 set -euo pipefail
 
@@ -242,11 +245,15 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5/6 · Lichess token (asked once, saved for every future run)
+# 5/6 · Lichess token
+#   durable store:  $HOME/chess-tui-token       (a VISIBLE file — dotfiles in
+#                   ephemeral VM homes, e.g. CodeHS, don't survive sessions)
+#   read by app:    $HOME/.config/chess-tui/config.toml  (synced from above)
 # ---------------------------------------------------------------------------
 printf '  %s[5/6]%s Lichess setup\n' "$CY" "$Z"
 LICHESS_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/chess-tui"
 LICHESS_CONF="$LICHESS_CONF_DIR/config.toml"
+TOKEN_FILE="${CHESS_TUI_TOKEN_FILE:-$HOME/chess-tui-token}"
 
 # test a token against the Lichess API:
 #   prints "ok:<username>" when valid, "bad" when rejected, "offline" when unreachable
@@ -270,24 +277,48 @@ lichess_check() {
   esac
 }
 
-TOKEN=""
-if [ -n "${LICHESS_TOKEN:-}" ]; then
-  RES="$(lichess_check "$LICHESS_TOKEN")"
-  case "$RES" in
-    ok:*) TOKEN="$LICHESS_TOKEN"; ok "token valid — welcome, ${RES#ok:}" ;;
-    bad) warn "Lichess rejected the provided token — not saving it" ;;
-    *) TOKEN="$LICHESS_TOKEN"; warn "couldn't reach lichess.org to test the token — saving it anyway" ;;
-  esac
-elif [ -f "$LICHESS_CONF" ] && grep -qE '^[[:space:]]*lichess_token[[:space:]]*=' "$LICHESS_CONF"; then
-  EXISTING="$(sed -n 's/^[[:space:]]*lichess_token[[:space:]]*=[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' "$LICHESS_CONF" | head -n1)"
-  if [ -z "$EXISTING" ]; then
-    ok "Lichess token already saved — keeping it"
+token_in_config() { [ -f "$LICHESS_CONF" ] && grep -qE '^[[:space:]]*lichess_token[[:space:]]*=' "$LICHESS_CONF"; }
+read_config_token() { sed -n 's/^[[:space:]]*lichess_token[[:space:]]*=[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' "$LICHESS_CONF" 2>/dev/null | head -n1; }
+read_token_file() { [ -f "$TOKEN_FILE" ] && head -n1 "$TOKEN_FILE" 2>/dev/null | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true; }
+write_token_file() {
+  [ -n "${1:-}" ] || return 0
+  ( umask 077; printf '%s\n' "$1" > "$TOKEN_FILE" )
+  chmod 600 "$TOKEN_FILE" 2>/dev/null || true
+}
+write_config_token() {
+  [ -n "${1:-}" ] || return 0
+  mkdir -p "$LICHESS_CONF_DIR"
+  ESC_TOKEN="$(printf '%s' "$1" | sed 's/[&"\\]/\\&/g')"
+  LINE="lichess_token = \"$ESC_TOKEN\""
+  if token_in_config; then
+    TMP_CONF="$LICHESS_CONF.tmp.$$"
+    sed "s#^[[:space:]]*lichess_token[[:space:]]*=.*#$LINE#" "$LICHESS_CONF" > "$TMP_CONF" && mv "$TMP_CONF" "$LICHESS_CONF"
   else
-    RES="$(lichess_check "$EXISTING")"
+    printf '%s\n' "$LINE" >> "$LICHESS_CONF"
+  fi
+  chmod 600 "$LICHESS_CONF" 2>/dev/null || true
+}
+
+# find a token: env > durable token file > config; then test it
+TOKEN=""; SOURCE=""; SAVE=0
+if [ -n "${LICHESS_TOKEN:-}" ]; then
+  TOKEN="$LICHESS_TOKEN"; SOURCE="environment"
+elif [ -n "$(read_token_file)" ]; then
+  TOKEN="$(read_token_file)"; SOURCE="$TOKEN_FILE"
+elif token_in_config && [ -n "$(read_config_token)" ]; then
+  TOKEN="$(read_config_token)"; SOURCE="$LICHESS_CONF"
+fi
+
+if [ -n "$TOKEN" ]; then
+  if [ "${CHESS_TUI_SKIP_TOKEN_CHECK:-}" = "1" ]; then
+    ok "token from $SOURCE (validation skipped)"
+    SAVE=1
+  else
+    RES="$(lichess_check "$TOKEN")"
     case "$RES" in
-      ok:*) ok "Lichess token already saved — valid (${RES#ok:})" ;;
-      bad) warn "the saved Lichess token is rejected by Lichess — re-run with a new one to replace it" ;;
-      *) warn "Lichess token already saved (couldn't test it — lichess.org unreachable)" ;;
+      ok:*) ok "token from $SOURCE — valid (${RES#ok:})"; SAVE=1 ;;
+      bad) warn "the Lichess token from $SOURCE is rejected by Lichess — re-run with a new one to replace it" ;;
+      *) warn "couldn't reach lichess.org to test the token from $SOURCE"; SAVE=1 ;;
     esac
   fi
 elif [ -t 0 ]; then
@@ -299,29 +330,24 @@ elif [ -t 0 ]; then
     IFS= read -rs TOKEN || TOKEN=""
     printf '\n'
     [ -z "$TOKEN" ] && break
+    if [ "${CHESS_TUI_SKIP_TOKEN_CHECK:-}" = "1" ]; then
+      ok "token accepted (validation skipped)"; SAVE=1; break
+    fi
     RES="$(lichess_check "$TOKEN")"
     case "$RES" in
-      ok:*) ok "token valid — welcome, ${RES#ok:}"; break ;;
+      ok:*) ok "token valid — welcome, ${RES#ok:}"; SAVE=1; break ;;
       bad) warn "Lichess rejected that token — try again, or press Enter to skip"; TOKEN=""; TRIES=$((TRIES + 1)) ;;
-      *) warn "couldn't reach lichess.org to test the token — saving it anyway"; break ;;
+      *) warn "couldn't reach lichess.org to test the token — saving it anyway"; SAVE=1; break ;;
     esac
   done
 else
-  warn "no terminal — skipping Lichess prompt (set LICHESS_TOKEN=... to save it unattended)"
+  warn "no terminal — skipping Lichess prompt (set LICHESS_TOKEN=... or create $TOKEN_FILE)"
 fi
 
-if [ -n "$TOKEN" ]; then
-  mkdir -p "$LICHESS_CONF_DIR"
-  ESC_TOKEN="$(printf '%s' "$TOKEN" | sed 's/[&"\\]/\\&/g')"
-  LINE="lichess_token = \"$ESC_TOKEN\""
-  if [ -f "$LICHESS_CONF" ] && grep -qE '^[[:space:]]*lichess_token[[:space:]]*=' "$LICHESS_CONF"; then
-    TMP_CONF="$LICHESS_CONF.tmp.$$"
-    sed "s#^[[:space:]]*lichess_token[[:space:]]*=.*#$LINE#" "$LICHESS_CONF" > "$TMP_CONF" && mv "$TMP_CONF" "$LICHESS_CONF"
-  else
-    printf '%s\n' "$LINE" >> "$LICHESS_CONF"
-  fi
-  chmod 600 "$LICHESS_CONF" 2>/dev/null || true
-  ok "saved to $LICHESS_CONF — used automatically every time"
+if [ "$SAVE" = 1 ] && [ -n "$TOKEN" ]; then
+  write_token_file "$TOKEN"    # durable, visible — survives ephemeral VM homes
+  write_config_token "$TOKEN"  # what chess-tui actually reads at startup
+  ok "saved to $TOKEN_FILE (durable) + synced into $LICHESS_CONF"
 fi
 
 # ---------------------------------------------------------------------------
@@ -353,19 +379,20 @@ if [ -t 0 ] && [ -t 1 ]; then
   printf '\n'
 
   # offer to sign out of Lichess (erases the saved token + env var)
-  if { [ -f "$LICHESS_CONF" ] && grep -qE '^[[:space:]]*lichess_token[[:space:]]*=' "$LICHESS_CONF"; } || [ -n "${LICHESS_TOKEN:-}" ]; then
+  if token_in_config || [ -f "$TOKEN_FILE" ] || [ -n "${LICHESS_TOKEN:-}" ]; then
     printf '  %s♟%s Sign out of Lichess? This erases the saved token. %s[y/N]%s ' "$CY" "$Z" "$D" "$Z"
     SIGNOUT=""
     IFS= read -r SIGNOUT || SIGNOUT=""
     case "${SIGNOUT:-}" in
       y|Y|yes|YES)
+        rm -f "$TOKEN_FILE"
         if [ -f "$LICHESS_CONF" ]; then
           TMP_CONF="$LICHESS_CONF.tmp.$$"
           grep -vE '^[[:space:]]*lichess_token[[:space:]]*=' "$LICHESS_CONF" > "$TMP_CONF" && mv "$TMP_CONF" "$LICHESS_CONF"
           chmod 600 "$LICHESS_CONF" 2>/dev/null || true
         fi
         unset LICHESS_TOKEN
-        ok "signed out — Lichess token erased from the config and this shell"
+        ok "signed out — Lichess token erased ($TOKEN_FILE and config)"
         ;;
       *) info "staying signed in" ;;
     esac
