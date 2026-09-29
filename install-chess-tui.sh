@@ -134,6 +134,31 @@ if [ "$SKIP_INSTALL" = 0 ]; then
   [ "$VARIANT" = nosound ] && SUFFIX="-nosound"
   ASSET="chess-tui-$TAG-x86_64-unknown-linux-gnu-glibc2.25$SUFFIX.tar.xz"
   URL="https://github.com/$REPO/releases/download/$TAG/$ASSET"
+
+  # If this release has no binary published YET (a fresh release whose build is
+  # still running), fall back to the newest release that does have the asset.
+  asset_exists() {
+    if command -v curl >/dev/null 2>&1; then
+      [ "$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 15 "$1" 2>/dev/null || printf '000')" = "200" ]
+    else
+      wget --spider -q --timeout=15 "$1" 2>/dev/null
+    fi
+  }
+  if ! asset_exists "$URL"; then
+    warn "no binary published for $TAG yet — looking for a previous release"
+    PREV_TAGS="$( { if command -v curl >/dev/null 2>&1; then curl -fsSL --max-time 15 "https://api.github.com/repos/$REPO/releases?per_page=5" 2>/dev/null; else wget -qO- --timeout=15 "https://api.github.com/repos/$REPO/releases?per_page=5" 2>/dev/null; fi; } \
+      | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4 | grep -vx "$TAG" || true)"
+    for prev in $PREV_TAGS; do
+      try_asset="chess-tui-$prev-x86_64-unknown-linux-gnu-glibc2.25$SUFFIX.tar.xz"
+      try_url="https://github.com/$REPO/releases/download/$prev/$try_asset"
+      if asset_exists "$try_url"; then
+        TAG="$prev"; ASSET="$try_asset"; URL="$try_url"
+        info "using $TAG instead"
+        break
+      fi
+    done
+  fi
+
   TMP="$(mktemp -d)"
   trap 'rm -rf "$TMP"' EXIT
 
@@ -326,7 +351,28 @@ if [ -t 0 ] && [ -t 1 ]; then
   info "launching chess-tui ... ${D}(q to quit, when asked)${Z}"
   "$BIN" || true
   printf '\n'
-  info "chess-tui exited — dropping you to a shell (type 'exit' to leave)"
+
+  # offer to sign out of Lichess (erases the saved token + env var)
+  if { [ -f "$LICHESS_CONF" ] && grep -qE '^[[:space:]]*lichess_token[[:space:]]*=' "$LICHESS_CONF"; } || [ -n "${LICHESS_TOKEN:-}" ]; then
+    printf '  %s♟%s Sign out of Lichess? This erases the saved token. %s[y/N]%s ' "$CY" "$Z" "$D" "$Z"
+    SIGNOUT=""
+    IFS= read -r SIGNOUT || SIGNOUT=""
+    case "${SIGNOUT:-}" in
+      y|Y|yes|YES)
+        if [ -f "$LICHESS_CONF" ]; then
+          TMP_CONF="$LICHESS_CONF.tmp.$$"
+          grep -vE '^[[:space:]]*lichess_token[[:space:]]*=' "$LICHESS_CONF" > "$TMP_CONF" && mv "$TMP_CONF" "$LICHESS_CONF"
+          chmod 600 "$LICHESS_CONF" 2>/dev/null || true
+        fi
+        unset LICHESS_TOKEN
+        ok "signed out — Lichess token erased from the config and this shell"
+        ;;
+      *) info "staying signed in" ;;
+    esac
+    printf '\n'
+  fi
+
+  info "dropping you to a shell (type 'exit' to leave)"
   exec bash
 else
   warn "no interactive terminal detected — installed only."
