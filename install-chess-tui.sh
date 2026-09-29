@@ -15,6 +15,7 @@
 #    CHESS_TUI_VARIANT=auto|sound|nosound
 #                                     force a build variant (default: auto)
 #    NO_LAUNCH=1                      install only, don't start the game
+#    LICHESS_TOKEN=<token>            save a Lichess API token non-interactively
 # ============================================================================
 set -euo pipefail
 
@@ -54,7 +55,7 @@ banner() {
 # ---------------------------------------------------------------------------
 step=1
 banner
-printf '  %s[1/5]%s checking environment\n' "$CY" "$Z"
+printf '  %s[1/6]%s checking environment\n' "$CY" "$Z"
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -136,7 +137,7 @@ if [ "$SKIP_INSTALL" = 0 ]; then
   TMP="$(mktemp -d)"
   trap 'rm -rf "$TMP"' EXIT
 
-  printf '  %s[2/5]%s downloading  %s\n' "$CY" "$Z" "$ASSET"
+  printf '  %s[2/6]%s downloading  %s\n' "$CY" "$Z" "$ASSET"
   if command -v curl >/dev/null 2>&1; then
     curl -fL --retry 3 --connect-timeout 15 --progress-bar -o "$TMP/$ASSET" "$URL" \
       || die "download failed — is github.com reachable from this machine?"
@@ -149,7 +150,7 @@ if [ "$SKIP_INSTALL" = 0 ]; then
   # -------------------------------------------------------------------------
   # 3/5 · integrity
   # -------------------------------------------------------------------------
-  printf '  %s[3/5]%s verifying integrity\n' "$CY" "$Z"
+  printf '  %s[3/6]%s verifying integrity\n' "$CY" "$Z"
   EXPECTED=""
   # 1) checksum published next to the release asset (preferred — always current)
   if command -v curl >/dev/null 2>&1; then
@@ -185,7 +186,7 @@ if [ "$SKIP_INSTALL" = 0 ]; then
   # -------------------------------------------------------------------------
   # 4/5 · install
   # -------------------------------------------------------------------------
-  printf '  %s[4/5]%s installing to %s\n' "$CY" "$Z" "$DIR"
+  printf '  %s[4/6]%s installing to %s\n' "$CY" "$Z" "$DIR"
   if command -v xz >/dev/null 2>&1; then
     tar -xJf "$TMP/$ASSET" -C "$TMP"
   elif command -v python3 >/dev/null 2>&1; then
@@ -210,15 +211,98 @@ PY
   }
   ok "$VER ready"
 else
-  printf '  %s[2/5]%s download skipped\n' "$CY" "$Z"
-  printf '  %s[3/5]%s integrity skipped\n' "$CY" "$Z"
-  printf '  %s[4/5]%s install skipped\n' "$CY" "$Z"
+  printf '  %s[2/6]%s download skipped\n' "$CY" "$Z"
+  printf '  %s[3/6]%s integrity skipped\n' "$CY" "$Z"
+  printf '  %s[4/6]%s install skipped\n' "$CY" "$Z"
 fi
 
 # ---------------------------------------------------------------------------
-# 5/5 · play
+# 5/6 · Lichess token (asked once, saved for every future run)
 # ---------------------------------------------------------------------------
-printf '  %s[5/5]%s ready to play\n' "$CY" "$Z"
+printf '  %s[5/6]%s Lichess setup\n' "$CY" "$Z"
+LICHESS_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/chess-tui"
+LICHESS_CONF="$LICHESS_CONF_DIR/config.toml"
+
+# test a token against the Lichess API:
+#   prints "ok:<username>" when valid, "bad" when rejected, "offline" when unreachable
+lichess_check() {
+  local tok="$1" code tmpf
+  tmpf="$(mktemp)"
+  if command -v curl >/dev/null 2>&1; then
+    code="$(curl -s -o "$tmpf" -w '%{http_code}' -m 10 -H "Authorization: Bearer $tok" \
+      https://lichess.org/api/account 2>/dev/null || printf '000')"
+  elif wget -qO- --timeout=10 --header="Authorization: Bearer $tok" \
+      https://lichess.org/api/account > "$tmpf" 2>/dev/null; then
+    code=200
+  else
+    code=000
+  fi
+  case "$code" in
+    200) RES_USER="$(grep -o '"username"[[:space:]]*:[[:space:]]*"[^"]*"' "$tmpf" | head -n1 | cut -d'"' -f4)"
+         rm -f "$tmpf"; printf 'ok:%s' "$RES_USER" ;;
+    401|403) rm -f "$tmpf"; printf 'bad' ;;
+    *) rm -f "$tmpf"; printf 'offline' ;;
+  esac
+}
+
+TOKEN=""
+if [ -n "${LICHESS_TOKEN:-}" ]; then
+  RES="$(lichess_check "$LICHESS_TOKEN")"
+  case "$RES" in
+    ok:*) TOKEN="$LICHESS_TOKEN"; ok "token valid — welcome, ${RES#ok:}" ;;
+    bad) warn "Lichess rejected the provided token — not saving it" ;;
+    *) TOKEN="$LICHESS_TOKEN"; warn "couldn't reach lichess.org to test the token — saving it anyway" ;;
+  esac
+elif [ -f "$LICHESS_CONF" ] && grep -qE '^[[:space:]]*lichess_token[[:space:]]*=' "$LICHESS_CONF"; then
+  EXISTING="$(sed -n 's/^[[:space:]]*lichess_token[[:space:]]*=[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' "$LICHESS_CONF" | head -n1)"
+  if [ -z "$EXISTING" ]; then
+    ok "Lichess token already saved — keeping it"
+  else
+    RES="$(lichess_check "$EXISTING")"
+    case "$RES" in
+      ok:*) ok "Lichess token already saved — valid (${RES#ok:})" ;;
+      bad) warn "the saved Lichess token is rejected by Lichess — re-run with a new one to replace it" ;;
+      *) warn "Lichess token already saved (couldn't test it — lichess.org unreachable)" ;;
+    esac
+  fi
+elif [ -t 0 ]; then
+  TRIES=0
+  while [ "$TRIES" -lt 3 ]; do
+    printf '    optional: paste your Lichess API token (hidden input), Enter to skip\n'
+    printf '    get one at %shttps://lichess.org/account/oauth/token%s\n' "$CY" "$Z"
+    printf '    token: '
+    IFS= read -rs TOKEN || TOKEN=""
+    printf '\n'
+    [ -z "$TOKEN" ] && break
+    RES="$(lichess_check "$TOKEN")"
+    case "$RES" in
+      ok:*) ok "token valid — welcome, ${RES#ok:}"; break ;;
+      bad) warn "Lichess rejected that token — try again, or press Enter to skip"; TOKEN=""; TRIES=$((TRIES + 1)) ;;
+      *) warn "couldn't reach lichess.org to test the token — saving it anyway"; break ;;
+    esac
+  done
+else
+  warn "no terminal — skipping Lichess prompt (set LICHESS_TOKEN=... to save it unattended)"
+fi
+
+if [ -n "$TOKEN" ]; then
+  mkdir -p "$LICHESS_CONF_DIR"
+  ESC_TOKEN="$(printf '%s' "$TOKEN" | sed 's/[&"\\]/\\&/g')"
+  LINE="lichess_token = \"$ESC_TOKEN\""
+  if [ -f "$LICHESS_CONF" ] && grep -qE '^[[:space:]]*lichess_token[[:space:]]*=' "$LICHESS_CONF"; then
+    TMP_CONF="$LICHESS_CONF.tmp.$$"
+    sed "s#^[[:space:]]*lichess_token[[:space:]]*=.*#$LINE#" "$LICHESS_CONF" > "$TMP_CONF" && mv "$TMP_CONF" "$LICHESS_CONF"
+  else
+    printf '%s\n' "$LINE" >> "$LICHESS_CONF"
+  fi
+  chmod 600 "$LICHESS_CONF" 2>/dev/null || true
+  ok "saved to $LICHESS_CONF — used automatically every time"
+fi
+
+# ---------------------------------------------------------------------------
+# 6/6 · play
+# ---------------------------------------------------------------------------
+printf '  %s[6/6]%s ready to play\n' "$CY" "$Z"
 if command -v stockfish >/dev/null 2>&1; then
   ok "Stockfish found at $(command -v stockfish) — play vs. the computer!"
 else
