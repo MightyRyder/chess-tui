@@ -1,0 +1,47 @@
+name: Mirror upstream releases
+
+# Watches thomas-mauran/chess-tui for new releases. When a version shows up
+# that this fork hasn't mirrored yet, it creates the tag + release here, which
+# triggers the "Upload binary to published release" workflow — so every new
+# upstream version automatically gets portable glibc 2.25 binaries and the
+# installer script attached. Also runnable manually from the Actions tab.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mirror-latest-upstream-release:
+    name: Mirror latest upstream release
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      name: Checkout fork
+      with:
+        fetch-depth: 0
+
+    - name: Create fork release if upstream has a new version
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        UPSTREAM="thomas-mauran/chess-tui"
+        TAG=$(curl -fsSL "https://api.github.com/repos/$UPSTREAM/releases/latest" \
+          | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+        echo "Latest upstream release: $TAG"
+        if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          echo "Release $TAG already exists in this fork — nothing to do."
+          exit 0
+        fi
+        git remote add upstream "https://github.com/$UPSTREAM.git"
+        git fetch --depth 1 upstream "refs/tags/$TAG:refs/tags/$TAG" || true
+        git push origin "refs/tags/$TAG" || true
+        gh release create "$TAG" \
+          --repo "$GITHUB_REPOSITORY" \
+          --title "$TAG" \
+          --notes "Portable Linux binaries (glibc 2.25, stripped + UPX) and the installer script are attached automatically by the release workflow."
+        echo "Created release $TAG — the release workflow will attach the binaries now."
