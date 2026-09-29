@@ -1,14 +1,91 @@
+diff --git a/src/app/game.rs b/src/app/game.rs
+index 154df62..a77a56f 100644
+--- a/src/app/game.rs
++++ b/src/app/game.rs
+@@ -123,10 +123,9 @@ impl App {
+             || self.game.logic.game_state == GameState::Draw
+         {
+             // Game ended - only show end screen if it's not already shown and not dismissed
+-            if self.ui_state.current_popup != Some(Popups::EndScreen)
+-                && self.ui_state.current_popup != Some(Popups::PuzzleEndScreen)
+-                && !self.ui_state.end_screen_dismissed
+-            {
++            // Only auto-show when nothing else is on screen: the player may
++            // have opened another popup (e.g. the rematch picker).
++            if self.ui_state.current_popup.is_none() && !self.ui_state.end_screen_dismissed {
+                 self.show_end_screen();
+             }
+             // Drop any resume save: the game is over, there is nothing left to continue.
 diff --git a/src/app/lichess.rs b/src/app/lichess.rs
-index e25f440..673e81e 100644
+index e25f440..5fee096 100644
 --- a/src/app/lichess.rs
 +++ b/src/app/lichess.rs
-@@ -178,65 +178,190 @@ impl App {
+@@ -84,9 +84,10 @@ impl App {
+         self.ui_state.show_message_popup(msg, Popups::Success);
+     }
+ 
+-    /// Starts a background thread to seek a Lichess correspondence game and opens the seeking popup.
+-    /// The result is polled each tick via `check_lichess_seek`.
+-    pub fn create_lichess_opponent(&mut self, cursor: u8) {
++    /// Starts a background thread to seek a rated Lichess game on the time
++    /// control selected on the Lichess menu, and opens the seeking popup.
++    /// The result is polled each tick via `check_lichess_updates`.
++    pub fn create_lichess_opponent(&mut self) {
+         let Ok(client) = self.lichess_state.require_client() else {
+             self.ui_state.show_message_popup(
+                 "Lichess client not properly initialized, did you configure a lichess token ?"
+@@ -103,16 +104,14 @@ impl App {
+         let cancellation_token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+         self.lichess_state.cancellation_token = Some(cancellation_token.clone());
+ 
+-        // Lichess board seek only supports Rapid/Classical (cursor 3 or 4 in
+-        // the shared time control list), both with zero increment.
+-        let idx = usize::from(cursor >= 4);
+-        let time = crate::constants::LICHESS_TIME_CONTROL_MINUTES[idx];
+-        let (time, increment) = (time, 0);
++        let idx = usize::from(self.lichess_state.seek_time_cursor)
++            .min(crate::constants::LICHESS_SEEK_TIME_CONTROLS.len() - 1);
++        let (_, minutes, increment) = crate::constants::LICHESS_SEEK_TIME_CONTROLS[idx];
+ 
+         self.ui_state.current_popup = Some(Popups::SeekingLichessGame);
+ 
+         std::thread::spawn(
+-            move || match client.seek_game(time, increment, cancellation_token) {
++            move || match client.seek_game(minutes, increment, cancellation_token) {
+                 Ok((game_id, color)) => {
+                     let _ = tx.send(LichessUpdate::SeekResult(Ok((game_id, color))));
+                 }
+@@ -178,65 +177,272 @@ impl App {
          });
      }
  
-+    /// Hosts a private Lichess game: creates a casual open challenge with the
-+    /// time control at `host_game_cursor`, shows the shareable code, and
-+    /// auto-joins the game as soon as an opponent accepts it.
++    /// Opens the host picker pre-targeted at the opponent of the finished
++    /// game, so a rematch challenge can be sent directly to them.
++    pub fn open_rematch_picker(&mut self) {
++        let Some(name) = self
++            .game
++            .logic
++            .opponent
++            .as_ref()
++            .and_then(|o| o.opponent_name.clone())
++        else {
++            self.ui_state.show_message_popup(
++                "Opponent name unknown — use Host Game instead.".to_string(),
++                Popups::Error,
++            );
++            return;
++        };
++
++        log::info!("Opening rematch picker (opponent: {})", name);
++        self.lichess_state.rematch_target = Some(name);
++        self.lichess_state.host_game_cursor = crate::constants::LICHESS_HOST_TIME_CONTROL_DEFAULT;
++        self.game.ui.prompt.reset();
++        self.ui_state.current_popup = Some(Popups::LichessHostGame);
++    }
++
++    /// Hosts a Lichess game: creates a challenge with the selected time
++    /// control (open challenge, or a direct rematch when a target is set),
++    /// shows the shareable code, and auto-joins once it is accepted.
 +    pub fn start_hosting_lichess_game(&mut self) {
 +        let Ok(client) = self.lichess_state.require_client() else {
 +            self.ui_state.show_message_popup(
@@ -24,6 +101,19 @@ index e25f440..673e81e 100644
 +            .min(crate::constants::LICHESS_HOST_TIME_CONTROLS.len() - 1);
 +        let (_, limit_seconds, increment_seconds) =
 +            crate::constants::LICHESS_HOST_TIME_CONTROLS[idx];
++        let rated = self.lichess_state.host_rated;
++        let rematch_target = self.lichess_state.rematch_target.clone();
++        let chosen_color = match self.lichess_state.host_color {
++            crate::state::lichess_state::HostColor::White => "white",
++            crate::state::lichess_state::HostColor::Black => "black",
++            crate::state::lichess_state::HostColor::Random => {
++                if rand::random::<bool>() {
++                    "white"
++                } else {
++                    "black"
++                }
++            }
++        };
 +
 +        let (tx, rx) = channel();
 +        self.lichess_state.receiver = Some(rx);
@@ -35,7 +125,18 @@ index e25f440..673e81e 100644
 +        self.ui_state.current_popup = Some(Popups::LichessHostWaiting);
 +
 +        std::thread::spawn(move || {
-+            let challenge = match client.create_open_challenge(limit_seconds, increment_seconds) {
++            let is_rematch = rematch_target.is_some();
++            let created = match &rematch_target {
++                Some(username) => client.create_challenge(
++                    username,
++                    limit_seconds,
++                    increment_seconds,
++                    rated,
++                    chosen_color,
++                ),
++                None => client.create_open_challenge(limit_seconds, increment_seconds, rated),
++            };
++            let challenge = match created {
 +                Ok(challenge) => challenge,
 +                Err(e) => {
 +                    let _ = tx.send(LichessUpdate::HostChallengeCreated(Err(e.to_string())));
@@ -45,7 +146,10 @@ index e25f440..673e81e 100644
 +
 +            // The open-challenge endpoint pairs two OTHER players, so this
 +            // account must claim one of the two seats before sharing the code.
-+            if let Err(e) = client.accept_challenge(&challenge.id, "white") {
++            // A direct challenge (rematch) already has us as a player.
++            if !is_rematch
++                && let Err(e) = client.accept_challenge(&challenge.id, chosen_color)
++            {
 +                let _ = client.cancel_challenge(&challenge.id);
 +                let _ = tx.send(LichessUpdate::HostGameFailed(format!(
 +                    "could not claim a seat in the challenge: {}",
@@ -89,12 +193,28 @@ index e25f440..673e81e 100644
 +        self.lichess_state.receiver = None;
 +        self.lichess_state.cancellation_token = None;
 +        self.lichess_state.host_challenge = None;
++        self.lichess_state.rematch_target = None;
 +        self.ui_state.close_popup();
 +        self.ui_state.current_page = Pages::LichessMenu;
 +    }
 +
      /// Polls the shared background channel once per tick and dispatches on message type.
      pub fn check_lichess_updates(&mut self) {
++        // Surface an opponent draw offer: flag it and prompt the draw menu.
++        let draw_offer_seen = if let Some(opponent) = self.game.logic.opponent.as_mut() {
++            let offered = opponent.draw_offer;
++            opponent.draw_offer = false;
++            offered
++        } else {
++            false
++        };
++        if draw_offer_seen {
++            self.lichess_state.draw_offer_pending = true;
++            if self.ui_state.current_popup.is_none() {
++                self.ui_state.current_popup = Some(Popups::LichessDrawMenu);
++            }
++        }
++
          if let Some(rx) = &self.lichess_state.receiver
              && let Ok(update) = rx.try_recv()
          {
@@ -183,6 +303,7 @@ index e25f440..673e81e 100644
 +                            }
 +                            self.lichess_state.cancellation_token = None;
 +                            self.lichess_state.host_challenge = None;
++                            self.lichess_state.rematch_target = None;
 +
 +                            match result {
 +                                Ok((game_id, color)) => {
@@ -231,6 +352,20 @@ index e25f440..673e81e 100644
 +                                );
 +                            }
 +                        },
++                        LichessUpdate::GameActionResult(result) => match result {
++                            Ok(message) => {
++                                // Abort/resign end the game: let the end screen
++                                // speak; only informational actions get a popup.
++                                if !message.starts_with("Game aborted")
++                                    && !message.starts_with("Game resigned")
++                                {
++                                    self.ui_state.show_message_popup(message, Popups::Success);
++                                }
++                            }
++                            Err(e) => {
++                                self.ui_state.show_message_popup(e, Popups::Error);
++                            }
++                        },
 +                        LichessUpdate::HostChallengeCreated(_) | LichessUpdate::HostGameFailed(_) => {}
                      }
 -                },
@@ -238,7 +373,163 @@ index e25f440..673e81e 100644
              }
          }
      }
-@@ -639,6 +764,50 @@ impl App {
+@@ -377,6 +583,7 @@ impl App {
+         self.game.logic.game_state = GameState::Playing;
+         self.ui_state.close_popup();
+         self.ui_state.end_screen_dismissed = false;
++        self.lichess_state.draw_offer_pending = false;
+ 
+         // Best-effort initial clock; the first game event resyncs with the server.
+         self.game.logic.clock = Clock::new(self.game_mode_state.get_time_control());
+@@ -487,8 +694,147 @@ impl App {
+         }
+     }
+ 
++    /// The game id of the currently open Lichess game, if any.
++    fn active_lichess_game_id(&self) -> Option<String> {
++        match self
++            .game
++            .logic
++            .opponent
++            .as_ref()
++            .and_then(|o| o.kind.as_ref())
++        {
++            Some(crate::game_logic::opponent::OpponentKind::Lichess { game_id, .. }) => {
++                Some(game_id.clone())
++            }
++            _ => None,
++        }
++    }
++
++    /// Whether the open Lichess game has no moves yet (abortable).
++    pub fn active_lichess_game_has_no_moves(&self) -> bool {
++        self.game.logic.game_board.move_history.is_empty()
++            && self
++                .game
++                .logic
++                .opponent
++                .as_ref()
++                .map(|o| o.initial_move_count == 0 && o.moves_received == 0)
++                .unwrap_or(true)
++    }
++
++    /// Aborts (no moves played) or resigns the game currently open on the board.
++    fn finish_active_lichess_game(&mut self, game_id: String) {
++        let abort = self.active_lichess_game_has_no_moves();
++
++        let Ok(client) = self.lichess_state.require_client() else {
++            self.ui_state.show_message_popup(
++                "Lichess client not properly initialized, did you configure a lichess token ?"
++                    .to_string(),
++                Popups::Error,
++            );
++            return;
++        };
++        let client = client.clone();
++
++        let (tx, rx) = channel();
++        self.lichess_state.receiver = Some(rx);
++        self.ui_state.close_popup();
++
++        std::thread::spawn(move || {
++            let result = if abort {
++                client.abort_game(&game_id)
++            } else {
++                client.resign_game(&game_id)
++            };
++            let message = match result {
++                Ok(()) => Ok(if abort {
++                    "Game aborted (no moves played).".to_string()
++                } else {
++                    "Game resigned.".to_string()
++                }),
++                Err(e) => Err(format!(
++                    "Failed to {} the game: {}",
++                    if abort { "abort" } else { "resign" },
++                    e
++                )),
++            };
++            let _ = tx.send(LichessUpdate::GameActionResult(message));
++        });
++    }
++
++    /// Offers a draw (or accepts the opponent's offer) in the active game.
++    pub fn offer_draw_active_game(&mut self) {
++        self.run_active_game_action(
++            |client, game_id| client.offer_draw(game_id),
++            "Draw offer sent.",
++        );
++    }
++
++    /// Declines the opponent's pending draw offer in the active game.
++    pub fn decline_draw_active_game(&mut self) {
++        self.run_active_game_action(
++            |client, game_id| client.decline_draw(game_id),
++            "Draw offer declined.",
++        );
++    }
++
++    /// Claims a draw in the active game (fifty-move rule, repetition).
++    pub fn claim_draw_active_game(&mut self) {
++        self.run_active_game_action(
++            |client, game_id| client.claim_draw(game_id),
++            "Draw claimed.",
++        );
++    }
++
++    /// Runs a board action against the active game in a background thread and
++    /// reports the outcome through [`Self::check_lichess_updates`].
++    fn run_active_game_action<F>(&mut self, action: F, success_message: &'static str)
++    where
++        F: FnOnce(&LichessClient, &str) -> Result<(), Box<dyn std::error::Error>> + Send + 'static,
++    {
++        let Some(game_id) = self.active_lichess_game_id() else {
++            self.ui_state.show_message_popup(
++                "No Lichess game is in progress.".to_string(),
++                Popups::Error,
++            );
++            return;
++        };
++
++        let Ok(client) = self.lichess_state.require_client() else {
++            self.ui_state.show_message_popup(
++                "Lichess client not properly initialized, did you configure a lichess token ?"
++                    .to_string(),
++                Popups::Error,
++            );
++            return;
++        };
++        let client = client.clone();
++
++        let (tx, rx) = channel();
++        self.lichess_state.receiver = Some(rx);
++        self.ui_state.close_popup();
++        self.lichess_state.draw_offer_pending = false;
++        if let Some(opponent) = self.game.logic.opponent.as_mut() {
++            opponent.draw_offer = false;
++        }
++
++        std::thread::spawn(move || {
++            let message = action(&client, &game_id)
++                .map(|_| success_message.to_string())
++                .map_err(|e| e.to_string());
++            let _ = tx.send(LichessUpdate::GameActionResult(message));
++        });
++    }
++
+     /// Resigns the currently selected game in a background thread and shows a success popup.
++    /// When a Lichess game is open on the board, that game is ended instead
++    /// (aborted when no moves have been played).
+     pub fn confirm_resign_game(&mut self) {
++        if let Some(game_id) = self.active_lichess_game_id() {
++            self.finish_active_lichess_game(game_id);
++            return;
++        }
++
+         if let Some(game) = self
+             .lichess_state
+             .ongoing_games
+@@ -639,6 +985,50 @@ impl App {
          }
      }
  
@@ -340,14 +631,52 @@ index 9780af1..c0739a8 100644
              }
              MainMenuItems::SettingsMenu => {
                  // Settings Menu
+diff --git a/src/app/multiplayer.rs b/src/app/multiplayer.rs
+index 98d65f5..fdafecf 100644
+--- a/src/app/multiplayer.rs
++++ b/src/app/multiplayer.rs
+@@ -82,6 +82,10 @@ impl App {
+                                 game_started: false,
+                                 initial_move_count: 0,
+                                 moves_received: 0,
++                                rated: None,
++                                speed: None,
++                                draw_offer: false,
++                                opponent_name: None,
+                             };
+                             // Poll repeatedly until game starts
+                             loop {
 diff --git a/src/constants.rs b/src/constants.rs
-index def5f2e..3f8908e 100644
+index def5f2e..226c199 100644
 --- a/src/constants.rs
 +++ b/src/constants.rs
-@@ -52,6 +52,36 @@ pub const LICHESS_TIME_CONTROL_OPTIONS: [&str; 2] = ["Rapid", "Classical"];
- /// [`LICHESS_TIME_CONTROL_OPTIONS`].
- pub const LICHESS_TIME_CONTROL_MINUTES: [u32; 2] = [10, 30];
+@@ -45,12 +45,52 @@ pub const SKIN_NAME_ASCII: &str = "ASCII";
+ /// Index into [`TIME_CONTROL_OPTIONS`] that selects the "Custom" entry.
+ pub const TIME_CONTROL_CUSTOM_INDEX: u8 = 6;
  
+-/// Time control presets offered when seeking a Lichess game. The board seek
+-/// API only allows Rapid and Classical for public real-time seeks.
+-pub const LICHESS_TIME_CONTROL_OPTIONS: [&str; 2] = ["Rapid", "Classical"];
+-/// Base minutes for each Lichess seek preset, aligned with
+-/// [`LICHESS_TIME_CONTROL_OPTIONS`].
+-pub const LICHESS_TIME_CONTROL_MINUTES: [u32; 2] = [10, 30];
++/// Time control presets for public Lichess seeks, as
++/// `(label, minutes, increment seconds)`. Public board-API seeks must be
++/// rated and at least 10 minutes; a minutes value of 0 creates a
++/// correspondence seek (3 days per move).
++pub const LICHESS_SEEK_TIME_CONTROLS: [(&str, u32, u32); 8] = [
++    ("Rapid 10+0", 10, 0),
++    ("Rapid 10+5", 10, 5),
++    ("Rapid 15+0", 15, 0),
++    ("Rapid 15+10", 15, 10),
++    ("Classical 30+0", 30, 0),
++    ("Classical 30+20", 30, 20),
++    ("Classical 60+0", 60, 0),
++    ("Correspondence 3d", 0, 0),
++];
++/// Default cursor into [`LICHESS_SEEK_TIME_CONTROLS`] (Rapid 10+0).
++pub const LICHESS_SEEK_TIME_CONTROL_DEFAULT: u8 = 0;
++
 +/// Time control presets offered when hosting a private Lichess game, as
 +/// `(label, clock limit in seconds, increment in seconds)`. A limit of 0
 +/// creates a correspondence challenge (3 days per move).
@@ -377,11 +706,10 @@ index def5f2e..3f8908e 100644
 +];
 +/// Default cursor into [`LICHESS_PUZZLE_DIFFICULTIES`] (Normal).
 +pub const LICHESS_PUZZLE_DIFFICULTY_DEFAULT: u8 = 2;
-+
+ 
  /// Display labels for the four bot difficulty presets.
  pub const BOT_DIFFICULTY_NAMES: [&str; 4] =
-     ["Easy (400)", "Medium (900)", "Hard (1500)", "Magnus (2700)"];
-@@ -191,6 +221,12 @@ pub enum Popups {
+@@ -191,6 +231,14 @@ pub enum Popups {
      Loading,
      /// Text input for chess engine path.
      EnterEnginePath,
@@ -391,9 +719,128 @@ index def5f2e..3f8908e 100644
 +    LichessHostWaiting,
 +    /// Difficulty picker for anonymous (no-token) Lichess puzzles.
 +    LichessPuzzleLevel,
++    /// Draw options popup for the active Lichess game.
++    LichessDrawMenu,
  }
  
  /// Base URL for all Lichess REST API requests.
+diff --git a/src/game_logic/game.rs b/src/game_logic/game.rs
+index a5cc08c..dde368e 100644
+--- a/src/game_logic/game.rs
++++ b/src/game_logic/game.rs
+@@ -915,6 +915,38 @@ impl GameLogic {
+             return true;
+         }
+ 
++        // The opponent has an unanswered draw offer on the table.
++        if message == "DRAW_OFFER" {
++            log::info!("Opponent offered a draw");
++            opponent.draw_offer = true;
++            return true;
++        }
++
++        // Game metadata (rated flag, speed, opponent name) sent on start.
++        if let Some(meta) = message.strip_prefix("GAME_META:") {
++            let mut parts = meta.splitn(3, ':');
++            if let Some(rated_flag) = parts.next() {
++                opponent.rated = Some(rated_flag == "1");
++            }
++            if let Some(speed) = parts.next()
++                && !speed.is_empty()
++            {
++                opponent.speed = Some(speed.to_string());
++            }
++            if let Some(name) = parts.next()
++                && !name.is_empty()
++            {
++                opponent.opponent_name = Some(name.to_string());
++            }
++            log::debug!(
++                "GAME_META parsed: rated={:?} speed={:?} opponent={:?}",
++                opponent.rated,
++                opponent.speed,
++                opponent.opponent_name
++            );
++            return true;
++        }
++
+         // Resync the clock with the server-reported remaining times (Lichess)
+         if message.starts_with("CLOCK_SYNC:") {
+             let parts: Vec<&str> = message.split(':').collect();
+diff --git a/src/game_logic/opponent.rs b/src/game_logic/opponent.rs
+index 816482d..7882bf8 100644
+--- a/src/game_logic/opponent.rs
++++ b/src/game_logic/opponent.rs
+@@ -32,6 +32,14 @@ pub struct Opponent {
+     pub initial_move_count: usize,
+     /// Counter for moves received from stream
+     pub moves_received: usize,
++    /// Lichess only: whether the game is rated (None when unknown/local).
++    pub rated: Option<bool>,
++    /// Lichess only: speed key from the game metadata (e.g. "blitz").
++    pub speed: Option<String>,
++    /// Lichess only: an unanswered draw offer from the opponent.
++    pub draw_offer: bool,
++    /// Lichess only: the opponent's username (used to request rematches).
++    pub opponent_name: Option<String>,
+ }
+ 
+ // Custom Default implementation
+@@ -44,6 +52,10 @@ impl Default for Opponent {
+             game_started: false,
+             initial_move_count: 0,
+             moves_received: 0,
++            rated: None,
++            speed: None,
++            draw_offer: false,
++            opponent_name: None,
+         }
+     }
+ }
+@@ -66,6 +78,10 @@ impl Clone for Opponent {
+             game_started: self.game_started,
+             initial_move_count: self.initial_move_count,
+             moves_received: self.moves_received,
++            rated: self.rated,
++            speed: self.speed.clone(),
++            draw_offer: self.draw_offer,
++            opponent_name: self.opponent_name.clone(),
+         }
+     }
+ }
+@@ -79,6 +95,10 @@ impl Opponent {
+             game_started: self.game_started,
+             initial_move_count: self.initial_move_count,
+             moves_received: self.moves_received,
++            rated: self.rated,
++            speed: self.speed.clone(),
++            draw_offer: self.draw_offer,
++            opponent_name: self.opponent_name.clone(),
+         }
+     }
+ 
+@@ -150,6 +170,10 @@ impl Opponent {
+                 game_started: false,
+                 initial_move_count: 0,
+                 moves_received: 0,
++                rated: None,
++                speed: None,
++                draw_offer: false,
++                opponent_name: None,
+             })
+         } else {
+             log::error!("Failed to connect after 5 attempts to {}", addr);
+@@ -181,6 +205,10 @@ impl Opponent {
+             game_started: true, // Lichess game starts immediately when we join/seek
+             initial_move_count,
+             moves_received: 0,
++            rated: None,
++            speed: None,
++            draw_offer: false,
++            opponent_name: None,
+         }
+     }
+ 
 diff --git a/src/game_logic/puzzle.rs b/src/game_logic/puzzle.rs
 index 3060199..42d2802 100644
 --- a/src/game_logic/puzzle.rs
@@ -606,7 +1053,7 @@ index 3060199..42d2802 100644
      }
  }
 diff --git a/src/handlers/lichess/lichess_menu.rs b/src/handlers/lichess/lichess_menu.rs
-index b6dcfe2..2b4faca 100644
+index b6dcfe2..b4611c5 100644
 --- a/src/handlers/lichess/lichess_menu.rs
 +++ b/src/handlers/lichess/lichess_menu.rs
 @@ -12,6 +12,7 @@ pub enum LichessMenuItems {
@@ -627,7 +1074,7 @@ index b6dcfe2..2b4faca 100644
              _ => unreachable!("Invalid LichessMenuItems value: {value}"),
          }
      }
-@@ -32,8 +34,8 @@ impl From<u8> for LichessMenuItems {
+@@ -32,16 +34,17 @@ impl From<u8> for LichessMenuItems {
  /// Supports navigation through menu items and selection.
  pub fn handle_lichess_menu_page_events(app: &mut App, key_event: KeyEvent) {
      match key_event.code {
@@ -636,10 +1083,29 @@ index b6dcfe2..2b4faca 100644
 +        KeyCode::Up | KeyCode::Char('k') => app.ui_state.menu_cursor_up(6), // 6 menu options
 +        KeyCode::Down | KeyCode::Char('j') => app.ui_state.menu_cursor_down(6),
          KeyCode::Right | KeyCode::Char('l') => {
-             // Only Rapid (3) and Classical (4) are valid for Lichess seeks.
-             let cursor = &mut app.game_mode_state.clock_cursor;
-@@ -81,7 +83,8 @@ pub fn handle_lichess_menu_page_events(app: &mut App, key_event: KeyEvent) {
-                     app.create_lichess_opponent(cursor);
+-            // Only Rapid (3) and Classical (4) are valid for Lichess seeks.
+-            let cursor = &mut app.game_mode_state.clock_cursor;
+-            *cursor = if *cursor >= 4 { 3 } else { 4 };
++            let count = crate::constants::LICHESS_SEEK_TIME_CONTROLS.len() as u8;
++            let cursor = &mut app.lichess_state.seek_time_cursor;
++            *cursor = if *cursor + 1 >= count { 0 } else { *cursor + 1 };
+         }
+         KeyCode::Left | KeyCode::Char('h') => {
+-            let cursor = &mut app.game_mode_state.clock_cursor;
+-            *cursor = if *cursor <= 3 { 4 } else { 3 };
++            let count = crate::constants::LICHESS_SEEK_TIME_CONTROLS.len() as u8;
++            let cursor = &mut app.lichess_state.seek_time_cursor;
++            *cursor = if *cursor == 0 { count - 1 } else { *cursor - 1 };
+         }
+         KeyCode::PageUp => {
+             // Scroll stats up
+@@ -77,11 +80,11 @@ pub fn handle_lichess_menu_page_events(app: &mut App, key_event: KeyEvent) {
+                     }
+                     app.ui_state.menu_cursor = 0;
+                     app.ui_state.current_page = Pages::Lichess;
+-                    let cursor = app.game_mode_state.clock_cursor.clamp(3, 4);
+-                    app.create_lichess_opponent(cursor);
++                    app.create_lichess_opponent();
                  }
                  LichessMenuItems::Puzzle => {
 -                    // Puzzle
@@ -662,7 +1128,7 @@ index b6dcfe2..2b4faca 100644
                          return;
                      }
                      app.start_puzzle_mode();
-@@ -144,6 +147,27 @@ pub fn handle_lichess_menu_page_events(app: &mut App, key_event: KeyEvent) {
+@@ -144,6 +147,28 @@ pub fn handle_lichess_menu_page_events(app: &mut App, key_event: KeyEvent) {
                      app.ui_state.current_popup = Some(Popups::EnterGameCode);
                      app.game.ui.prompt.reset();
                  }
@@ -684,27 +1150,89 @@ index b6dcfe2..2b4faca 100644
 +                    }
 +                    app.lichess_state.host_game_cursor =
 +                        crate::constants::LICHESS_HOST_TIME_CONTROL_DEFAULT;
++                    app.lichess_state.rematch_target = None;
 +                    app.game.ui.prompt.reset();
 +                    app.ui_state.current_popup = Some(Popups::LichessHostGame);
 +                }
                  LichessMenuItems::Disconnect => {
                      // Disconnect
                      app.disconnect_lichess();
+diff --git a/src/handlers/multiplayer.rs b/src/handlers/multiplayer.rs
+index c43b12f..b24e339 100644
+--- a/src/handlers/multiplayer.rs
++++ b/src/handlers/multiplayer.rs
+@@ -1,11 +1,37 @@
+ //! Multiplayer game keyboard handler.
+ 
+-use crate::{app::App, handlers::handler::chess_inputs};
++use crate::{
++    app::App,
++    constants::{Pages, Popups},
++    handlers::handler::chess_inputs,
++};
+ use ratatui::crossterm::event::{KeyCode, KeyEvent};
+ 
+ /// Handles keyboard input during multiplayer game mode.
+ /// Similar to solo mode but includes cleanup of network connections.
+ pub fn handle_multiplayer_page_events(app: &mut App, key_event: KeyEvent) {
++    // In an active Lichess game: r = resign/abort, d = draw options.
++    if app.ui_state.current_page == Pages::Lichess
++        && app
++            .game
++            .logic
++            .opponent
++            .as_ref()
++            .is_some_and(|o| o.is_lichess())
++    {
++        match key_event.code {
++            KeyCode::Char('r') | KeyCode::Char('R') => {
++                app.ui_state.current_popup = Some(Popups::ResignConfirmation);
++                return;
++            }
++            KeyCode::Char('d') | KeyCode::Char('D') => {
++                app.ui_state.current_popup = Some(Popups::LichessDrawMenu);
++                return;
++            }
++            _ => {}
++        }
++    }
++
+     match key_event.code {
+         KeyCode::Char('b') => {
+             // Return to home menu - disconnect from opponent and reset state
 diff --git a/src/handlers/popup.rs b/src/handlers/popup.rs
-index 4559c8a..2297423 100644
+index 4559c8a..06249ce 100644
 --- a/src/handlers/popup.rs
 +++ b/src/handlers/popup.rs
-@@ -27,6 +27,9 @@ pub fn handle_popup_input(app: &mut App, key_event: KeyEvent, popup: Popups) {
+@@ -27,6 +27,10 @@ pub fn handle_popup_input(app: &mut App, key_event: KeyEvent, popup: Popups) {
          Popups::EnterGameCode => handle_enter_game_code(app, key_event),
          Popups::EnterLichessToken => handle_enter_lichess_token(app, key_event),
          Popups::SeekingLichessGame => handle_seeking_lichess_game(app, key_event),
 +        Popups::LichessHostGame => handle_lichess_host_game(app, key_event),
 +        Popups::LichessHostWaiting => handle_lichess_host_waiting(app, key_event),
 +        Popups::LichessPuzzleLevel => handle_lichess_puzzle_level(app, key_event),
++        Popups::LichessDrawMenu => handle_lichess_draw_menu(app, key_event),
          Popups::ResignConfirmation => handle_resign_confirmation(app, key_event),
          Popups::MoveInputSelection => handle_move_input_selection(app, key_event),
          Popups::EnterEnginePath => handle_enter_engine_path(app, key_event),
-@@ -245,6 +248,53 @@ fn handle_enter_lichess_token(app: &mut App, key_event: KeyEvent) {
+@@ -91,7 +95,15 @@ fn handle_end_screen(app: &mut App, key_event: KeyEvent) {
+             app.ui_state.end_screen_dismissed = true;
+         }
+         KeyCode::Char('r' | 'R') => {
+-            if app.game.logic.opponent.is_none() {
++            if app
++                .game
++                .logic
++                .opponent
++                .as_ref()
++                .is_some_and(|o| o.is_lichess())
++            {
++                app.open_rematch_picker();
++            } else if app.game.logic.opponent.is_none() {
+                 app.restart();
+                 app.ui_state.close_popup();
+             }
+@@ -245,6 +257,74 @@ fn handle_enter_lichess_token(app: &mut App, key_event: KeyEvent) {
      }
  }
  
@@ -718,6 +1246,17 @@ index 4559c8a..2297423 100644
 +        KeyCode::Down | KeyCode::Char('j') => {
 +            let cursor = &mut app.lichess_state.host_game_cursor;
 +            *cursor = if *cursor + 1 >= count { 0 } else { *cursor + 1 };
++        }
++        KeyCode::Char('r') | KeyCode::Char('R') => {
++            app.lichess_state.host_rated = !app.lichess_state.host_rated;
++        }
++        KeyCode::Char('c') | KeyCode::Char('C') => {
++            use crate::state::lichess_state::HostColor;
++            app.lichess_state.host_color = match app.lichess_state.host_color {
++                HostColor::White => HostColor::Black,
++                HostColor::Black => HostColor::Random,
++                HostColor::Random => HostColor::White,
++            };
 +        }
 +        KeyCode::Enter | KeyCode::Char(' ') => app.start_hosting_lichess_game(),
 +        KeyCode::Esc => {
@@ -755,11 +1294,29 @@ index 4559c8a..2297423 100644
 +    }
 +}
 +
++fn handle_lichess_draw_menu(app: &mut App, key_event: KeyEvent) {
++    match key_event.code {
++        KeyCode::Char('o') | KeyCode::Char('O') => app.offer_draw_active_game(),
++        KeyCode::Char('n') | KeyCode::Char('N') => app.decline_draw_active_game(),
++        KeyCode::Char('c') | KeyCode::Char('C') => app.claim_draw_active_game(),
++        KeyCode::Esc => app.ui_state.close_popup(),
++        _ => fallback_key_handler(app, key_event),
++    }
++}
++
  fn handle_seeking_lichess_game(app: &mut App, key_event: KeyEvent) {
      match key_event.code {
          KeyCode::Esc => {
+@@ -309,6 +389,7 @@ fn handle_move_input_selection(app: &mut App, key_event: KeyEvent) {
+             app.game
+                 .apply_player_move(from, chess_move.to(), chess_move.promotion());
+             app.game.ui.prompt.reset();
++            app.ui_state.close_popup();
+         }
+         KeyCode::Char(to_insert) => app.game.ui.prompt.enter_char(to_insert),
+         KeyCode::Backspace => app.game.ui.prompt.delete_char(),
 diff --git a/src/lichess/game.rs b/src/lichess/game.rs
-index d7c2aa2..a15d7a1 100644
+index d7c2aa2..5e279b1 100644
 --- a/src/lichess/game.rs
 +++ b/src/lichess/game.rs
 @@ -1,7 +1,7 @@
@@ -771,24 +1328,25 @@ index d7c2aa2..a15d7a1 100644
  use shakmaty::Color;
  use std::error::Error;
  use std::io::{BufRead, BufReader};
-@@ -494,4 +494,160 @@ impl LichessClient {
+@@ -494,4 +494,287 @@ impl LichessClient {
          log::info!("Successfully resigned game: {}", game_id);
          Ok(())
      }
 +
-+    /// Create a casual open challenge with the given clock. A limit of 0
-+    /// creates a correspondence challenge (3 days per move). The returned
-+    /// challenge can be shared with an opponent; it becomes a game once
-+    /// accepted, keeping the same id.
++    /// Create an open challenge with the given clock. A limit of 0 creates a
++    /// correspondence challenge (3 days per move); `rated` selects a rated
++    /// game. The returned challenge can be shared with an opponent; it
++    /// becomes a game once accepted, keeping the same id.
 +    pub fn create_open_challenge(
 +        &self,
 +        limit_seconds: u32,
 +        increment_seconds: u32,
++        rated: bool,
 +    ) -> Result<OpenChallenge, Box<dyn Error>> {
 +        let url = format!("{}/challenge/open", LICHESS_API_URL);
 +
 +        let mut form: Vec<(&str, String)> = vec![
-+            ("rated", "false".to_string()),
++            ("rated", if rated { "true" } else { "false" }.to_string()),
 +            ("variant", "standard".to_string()),
 +        ];
 +        if limit_seconds == 0 {
@@ -840,6 +1398,57 @@ index d7c2aa2..a15d7a1 100644
 +            challenge.id,
 +            challenge.url
 +        );
++        Ok(challenge)
++    }
++
++    /// Challenge a specific user to a game (used for rematches). The
++    /// challenger is a player, so no seat claim is needed once accepted.
++    pub fn create_challenge(
++        &self,
++        username: &str,
++        limit_seconds: u32,
++        increment_seconds: u32,
++        rated: bool,
++        color: &str,
++    ) -> Result<OpenChallenge, Box<dyn Error>> {
++        let url = format!("{}/challenge/{}", LICHESS_API_URL, username);
++
++        let mut form: Vec<(&str, String)> = vec![
++            ("rated", if rated { "true" } else { "false" }.to_string()),
++            ("variant", "standard".to_string()),
++            ("color", color.to_string()),
++        ];
++        if limit_seconds == 0 {
++            form.push(("days", "3".to_string()));
++        } else {
++            form.push(("clock.limit", limit_seconds.to_string()));
++            form.push(("clock.increment", increment_seconds.to_string()));
++        }
++
++        let response = self
++            .client
++            .post(&url)
++            .header(
++                "User-Agent",
++                "chess-tui (https://github.com/thomas-mauran/chess-tui)",
++            )
++            .bearer_auth(&self.token)
++            .form(&form)
++            .send()?;
++
++        let status = response.status();
++        if !status.is_success() {
++            let error_text = response.text().unwrap_or_default();
++            log::error!("Challenge request failed: {} - {}", status, error_text);
++            return Err(format!(
++                "Lichess rejected the challenge: {}",
++                extract_error_message(&error_text, status)
++            )
++            .into());
++        }
++
++        let challenge: OpenChallenge = response.json()?;
++        log::info!("Created challenge vs {}: {}", username, challenge.id);
 +        Ok(challenge)
 +    }
 +
@@ -931,12 +1540,122 @@ index d7c2aa2..a15d7a1 100644
 +
 +        Err("Timed out waiting for an opponent to join".into())
 +    }
++
++    /// Abort an in-progress game with no moves played (no rating impact).
++    pub fn abort_game(&self, game_id: &str) -> Result<(), Box<dyn Error>> {
++        let url = format!("{}/board/game/{}/abort", LICHESS_API_URL, game_id);
++        self.post_game_action(&url, "abort the game")
++    }
++
++    /// Offer a draw, or accept the opponent's pending draw offer.
++    pub fn offer_draw(&self, game_id: &str) -> Result<(), Box<dyn Error>> {
++        let url = format!("{}/board/game/{}/draw/yes", LICHESS_API_URL, game_id);
++        self.post_game_action(&url, "offer a draw")
++    }
++
++    /// Decline the opponent's pending draw offer.
++    pub fn decline_draw(&self, game_id: &str) -> Result<(), Box<dyn Error>> {
++        let url = format!("{}/board/game/{}/draw/no", LICHESS_API_URL, game_id);
++        self.post_game_action(&url, "decline the draw offer")
++    }
++
++    /// Claim a draw (fifty-move rule, threefold repetition).
++    pub fn claim_draw(&self, game_id: &str) -> Result<(), Box<dyn Error>> {
++        let url = format!("{}/board/game/{}/claim-draw", LICHESS_API_URL, game_id);
++        self.post_game_action(&url, "claim a draw")
++    }
++
++    /// POST a board game action and surface Lichess's error message on failure.
++    fn post_game_action(&self, url: &str, action: &str) -> Result<(), Box<dyn Error>> {
++        let response = self
++            .client
++            .post(url)
++            .header(
++                "User-Agent",
++                "chess-tui (https://github.com/thomas-mauran/chess-tui)",
++            )
++            .bearer_auth(&self.token)
++            .send()?;
++
++        let status = response.status();
++        if !status.is_success() {
++            let body = response.text().unwrap_or_default();
++            log::error!("Failed to {}: {} - {}", action, status, body);
++            return Err(format!(
++                "Failed to {}: {}",
++                action,
++                extract_error_message(&body, status)
++            )
++            .into());
++        }
++
++        log::info!("Lichess action succeeded: {}", action);
++        Ok(())
++    }
++}
++
++/// Extracts Lichess's human-readable error message from an error response body.
++fn extract_error_message(body: &str, status: reqwest::StatusCode) -> String {
++    if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
++        if let Some(error) = json.get("error") {
++            if let Some(message) = error.as_str() {
++                return message.to_string();
++            }
++            return error.to_string();
++        }
++        if let Some(global) = json.get("global").and_then(|g| g.as_array()) {
++            let messages: Vec<&str> = global.iter().filter_map(|v| v.as_str()).collect();
++            if !messages.is_empty() {
++                return messages.join(", ");
++            }
++        }
++    }
++    if body.trim().is_empty() {
++        status.to_string()
++    } else {
++        body.trim().to_string()
++    }
  }
 diff --git a/src/lichess/models.rs b/src/lichess/models.rs
-index 22dbec4..6078689 100644
+index 22dbec4..5ffcfb6 100644
 --- a/src/lichess/models.rs
 +++ b/src/lichess/models.rs
-@@ -91,6 +91,14 @@ pub struct OngoingGamesResponse {
+@@ -17,6 +17,12 @@ pub enum GameEvent {
+         white: Player,
+         black: Player,
+         state: GameState,
++        /// Whether the game is rated (Lichess).
++        #[serde(default)]
++        rated: bool,
++        /// Speed key from the game metadata, e.g. "blitz" (Lichess).
++        #[serde(default)]
++        speed: String,
+     },
+     #[serde(rename = "gameState")]
+     GameState(GameState),
+@@ -53,6 +59,8 @@ pub struct EventStreamGame {
+ #[derive(Debug, Deserialize)]
+ pub struct Player {
+     pub id: Option<String>,
++    #[serde(default)]
++    pub name: String,
+ }
+ 
+ #[derive(Debug, Deserialize)]
+@@ -63,6 +71,12 @@ pub struct GameState {
+     pub wtime: usize,
+     #[serde(default)]
+     pub btime: usize,
++    /// White has a pending draw offer (Lichess).
++    #[serde(default)]
++    pub wdraw: bool,
++    /// Black has a pending draw offer (Lichess).
++    #[serde(default)]
++    pub bdraw: bool,
+ }
+ 
+ #[derive(Debug, Deserialize, Clone)]
+@@ -91,6 +105,14 @@ pub struct OngoingGamesResponse {
      pub now_playing: Vec<OngoingGame>,
  }
  
@@ -951,7 +1670,7 @@ index 22dbec4..6078689 100644
  #[derive(Debug, Deserialize, Clone)]
  pub struct Puzzle {
      pub game: PuzzleGame,
-@@ -243,6 +251,16 @@ pub struct LichessClient {
+@@ -243,6 +265,16 @@ pub struct LichessClient {
  
  impl LichessClient {
      pub fn new(token: String) -> Self {
@@ -1031,11 +1750,98 @@ index 20195d2..6fca4cb 100644
  
          if !response.status().is_success() {
              return Err(format!("Failed to fetch puzzle: {}", response.status()).into());
+diff --git a/src/lichess/stream.rs b/src/lichess/stream.rs
+index 6e16f16..c7efcb5 100644
+--- a/src/lichess/stream.rs
++++ b/src/lichess/stream.rs
+@@ -156,7 +156,7 @@ impl LichessClient {
+         &self,
+         game_id: String,
+         move_tx: Sender<String>,
+-        _player_color: Option<Color>,
++        player_color: Option<Color>,
+     ) {
+         let client: Client = self.client.clone();
+         let token = self.token.clone();
+@@ -166,6 +166,7 @@ impl LichessClient {
+             let mut last_turns: Option<usize> = None;
+             let mut last_move_seen: Option<String> = None;
+             let mut last_status: Option<String> = None;
++            let mut last_draw_offer = false;
+ 
+             loop {
+                 let stream_url = format!("{}/board/game/stream/{}", LICHESS_API_URL, game_id);
+@@ -221,10 +222,26 @@ impl LichessClient {
+                     match serde_json::from_str::<GameEvent>(&line) {
+                         Ok(GameEvent::GameFull {
+                             id: _,
+-                            white: _,
+-                            black: _,
++                            white,
++                            black,
+                             state,
++                            rated,
++                            speed,
+                         }) => {
++                            // Tell the UI whether the game is rated, its speed
++                            // and the opponent's name (used for rematches).
++                            let opponent_name = match player_color {
++                                Some(Color::White) => &black.name,
++                                Some(Color::Black) => &white.name,
++                                None => "",
++                            };
++                            let _ = move_tx.send(format!(
++                                "GAME_META:{}:{}:{}",
++                                if rated { 1 } else { 0 },
++                                speed,
++                                opponent_name
++                            ));
++
+                             // Handle initial game state
+                             if last_turns.is_none() {
+                                 let turns = state.moves.split_whitespace().count();
+@@ -247,6 +264,18 @@ impl LichessClient {
+                             send_clock_sync(&state, &move_tx);
+                         }
+                         Ok(GameEvent::GameState(state)) => {
++                            // Draw offer tracking: notify the app when the
++                            // opponent has a (new) draw offer on the table.
++                            let opponent_offered = match player_color {
++                                Some(Color::White) => state.bdraw,
++                                Some(Color::Black) => state.wdraw,
++                                None => false,
++                            };
++                            if opponent_offered && !last_draw_offer {
++                                let _ = move_tx.send("DRAW_OFFER".to_string());
++                            }
++                            last_draw_offer = opponent_offered;
++
+                             // Handle game state updates (new moves)
+                             let current_turns = state.moves.split_whitespace().count();
+ 
 diff --git a/src/state/lichess_state.rs b/src/state/lichess_state.rs
-index 5f1032e..046c8db 100644
+index 5f1032e..4d126b2 100644
 --- a/src/state/lichess_state.rs
 +++ b/src/state/lichess_state.rs
-@@ -11,6 +11,10 @@ pub enum LichessUpdate {
+@@ -7,10 +7,30 @@ use crate::{
+ use shakmaty::Color;
+ use std::sync::mpsc::Receiver;
+ 
++/// Color choice for hosted Lichess games.
++#[derive(Clone, Copy, PartialEq)]
++pub enum HostColor {
++    White,
++    Black,
++    Random,
++}
++
++impl Default for HostColor {
++    fn default() -> Self {
++        HostColor::White
++    }
++}
++
+ pub enum LichessUpdate {
      ProfileResult(Result<Box<(UserProfile, Vec<RatingHistoryEntry>)>, String>),
      SeekResult(Result<(String, Color), String>),
      OngoingGamesResult(Result<Vec<OngoingGame>, String>),
@@ -1043,10 +1849,12 @@ index 5f1032e..046c8db 100644
 +    HostChallengeCreated(Result<(String, String), String>),
 +    /// Hosting aborted after the challenge existed (timeout or network error).
 +    HostGameFailed(String),
++    /// Result of an in-game action (resign/abort/draw): success text or error.
++    GameActionResult(Result<String, String>),
  }
  
  /// All Lichess-related runtime state held by [`crate::app::App`].
-@@ -39,6 +43,14 @@ pub struct LichessState {
+@@ -39,6 +59,25 @@ pub struct LichessState {
      pub puzzle_game: Option<PuzzleGame>,
      /// Lichess menu stats scroll offset
      pub lichess_stats_scroll: u16,
@@ -1058,18 +1866,67 @@ index 5f1032e..046c8db 100644
 +    /// Cursor into `LICHESS_PUZZLE_DIFFICULTIES` while picking an anonymous
 +    /// puzzle level.
 +    pub puzzle_level_cursor: u8,
++    /// Cursor into `LICHESS_SEEK_TIME_CONTROLS` on the Lichess menu.
++    pub seek_time_cursor: u8,
++    /// Host a rated game instead of a casual one.
++    pub host_rated: bool,
++    /// Color to claim when hosting (or request in a rematch challenge).
++    pub host_color: HostColor,
++    /// When set, the next host flow sends a direct rematch challenge to this
++    /// Lichess username instead of creating an open challenge.
++    pub rematch_target: Option<String>,
++    /// The opponent has an unanswered draw offer on the table.
++    pub draw_offer_pending: bool,
  }
  
  impl LichessState {
+diff --git a/src/ui/game_ui.rs b/src/ui/game_ui.rs
+index 4fc56ac..3a559d5 100644
+--- a/src/ui/game_ui.rs
++++ b/src/ui/game_ui.rs
+@@ -91,6 +91,32 @@ pub fn render_game_ui(frame: &mut Frame<'_>, app: &mut App, main_area: Rect) {
+             board_with_labels[0],
+             Instant::now(),
+         );
++
++        // Show whether the Lichess game is rated and its speed.
++        if let Some(opponent) = app.game.logic.opponent.as_ref()
++            && let Some(rated) = opponent.rated
++        {
++            let mut label = String::from(if rated { "Rated" } else { "Casual" });
++            if let Some(speed) = opponent.speed.as_deref()
++                && !speed.is_empty()
++            {
++                label.push(' ');
++                label.push_str(speed);
++            }
++            let text_width = label.len() as u16;
++            let clock_area = board_with_labels[0];
++            let x = clock_area.x + clock_area.width.saturating_sub(text_width) / 2;
++            let text_area = Rect {
++                x,
++                y: clock_area.y,
++                width: text_width.min(clock_area.width),
++                height: 1,
++            };
++            frame.render_widget(
++                Paragraph::new(label).style(Style::default().fg(Color::Yellow)),
++                text_area,
++            );
++        }
+     }
+ 
+     let board_index = if has_clock { 1 } else { 0 };
 diff --git a/src/ui/main_ui.rs b/src/ui/main_ui.rs
-index 12f1282..dfa5e61 100644
+index 12f1282..332fe6f 100644
 --- a/src/ui/main_ui.rs
 +++ b/src/ui/main_ui.rs
-@@ -23,7 +23,10 @@ use crate::{
+@@ -23,7 +23,11 @@ use crate::{
              error::render_error_popup,
              help::render_help_popup,
              lichess::{
 -                game_code::render_enter_game_code_popup, puzzle_end::render_puzzle_end_popup,
++                draw_menu::render_draw_menu_popup,
 +                game_code::render_enter_game_code_popup,
 +                host_game::{render_host_game_popup, render_host_game_waiting_popup},
 +                puzzle_end::render_puzzle_end_popup,
@@ -1077,7 +1934,7 @@ index 12f1282..dfa5e61 100644
                  token::render_enter_lichess_token_popup,
              },
              loading::render_loading_popup,
-@@ -114,6 +117,15 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
+@@ -114,9 +118,21 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>) {
          Some(Popups::EnterLichessToken) => {
              render_enter_lichess_token_popup(frame, &app.game.ui.prompt);
          }
@@ -1093,11 +1950,131 @@ index 12f1282..dfa5e61 100644
          Some(Popups::ResignConfirmation) => {
              render_resign_confirmation_popup(frame, app);
          }
++        Some(Popups::LichessDrawMenu) => {
++            render_draw_menu_popup(frame, app);
++        }
+         Some(Popups::PuzzleEndScreen) => {
+             // Show puzzle completion message
+             let message = if let Some(ref msg) = app.ui_state.popup_message {
 diff --git a/src/ui/menu/lichess_menu.rs b/src/ui/menu/lichess_menu.rs
-index f303480..9301b0e 100644
+index f303480..3c1a91e 100644
 --- a/src/ui/menu/lichess_menu.rs
 +++ b/src/ui/menu/lichess_menu.rs
-@@ -170,6 +170,7 @@ fn render_menu_panel(frame: &mut Frame, app: &App, area: Rect) {
+@@ -1,7 +1,7 @@
+ //! Renders the user profile, rating sparkline, and menu options for the Lichess landing page.
+ 
+ use super::rating_chart::render_rating_history_chart;
+-use crate::{app::App, constants::LICHESS_TIME_CONTROL_OPTIONS};
++use crate::app::App;
+ use ratatui::{
+     Frame,
+     layout::{Alignment, Constraint, Direction, Layout, Rect},
+@@ -43,7 +43,7 @@ impl LichessLayout {
+             .direction(Direction::Vertical)
+             .constraints([
+                 Constraint::Percentage(90), // Menu
+-                Constraint::Length(3),      // Time control
++                Constraint::Length(4),      // Seek settings
+             ])
+             .split(content_stats[0]);
+ 
+@@ -111,57 +111,51 @@ pub fn render_lichess_menu(frame: &mut Frame, app: &App) {
+     frame.render_widget(footer, layout.footer);
+ }
+ 
+-/// Renders the time control selector (Rapid/Classical), showing the base
+-/// minutes of each preset. Only the selected text gets a highlighted
+-/// background, sized to the text itself.
++/// Renders the seek settings: the rated time-control preset (cycle with ←/→)
++/// and the rating mode. Public board seeks are always rated.
+ fn render_time_control(frame: &mut Frame, app: &App, area: Rect) {
+-    use crate::constants::LICHESS_TIME_CONTROL_MINUTES;
++    use crate::constants::LICHESS_SEEK_TIME_CONTROLS;
+ 
+-    let menu = Block::default()
++    let block = Block::default()
+         .borders(Borders::ALL)
+         .border_type(BorderType::Rounded)
+-        .title("Time Control");
+-    let inner_area = menu.inner(area);
+-    frame.render_widget(menu, area);
+-
+-    // Lichess only allows the Rapid (3) and Classical (4) presets.
+-    let selected = usize::from(app.game_mode_state.clock_cursor >= 4);
+-
+-    let labels: Vec<String> = LICHESS_TIME_CONTROL_OPTIONS
+-        .iter()
+-        .enumerate()
+-        .map(|(idx, name)| format!("{} {}m", name, LICHESS_TIME_CONTROL_MINUTES[idx]))
+-        .collect();
+-
+-    let widths: Vec<Constraint> = labels
+-        .iter()
+-        .map(|label| Constraint::Length(label.len() as u16 + 2))
+-        .collect();
+-    let button_area = Layout::default()
+-        .direction(Direction::Horizontal)
+-        .constraints(widths)
+-        .split(inner_area);
+-
+-    for (idx, label) in labels.iter().enumerate() {
+-        let style = if idx == selected {
++        .title("Seek Settings");
++    let inner = block.inner(area);
++    frame.render_widget(block, area);
++
++    let idx = usize::from(app.lichess_state.seek_time_cursor)
++        .min(LICHESS_SEEK_TIME_CONTROLS.len() - 1);
++    let label = LICHESS_SEEK_TIME_CONTROLS[idx].0;
++
++    let rows = Layout::default()
++        .direction(Direction::Vertical)
++        .constraints([Constraint::Length(1), Constraint::Length(1)])
++        .split(inner);
++
++    let time_line = Line::from(vec![
++        Span::styled("Time  ", Style::default().fg(Color::Cyan)),
++        Span::styled("◀ ", Style::default().fg(Color::White)),
++        Span::styled(
++            label,
+             Style::default()
+                 .fg(Color::Black)
+                 .bg(Color::White)
+-                .add_modifier(Modifier::BOLD)
+-        } else {
+-            Style::default().fg(Color::White)
+-        };
+-
+-        // Size the render area to the text so the highlight hugs the label.
+-        let text_len = label.len() as u16;
+-        let text_rect = Rect {
+-            x: button_area[idx].x + button_area[idx].width.saturating_sub(text_len) / 2,
+-            y: button_area[idx].y,
+-            width: text_len.min(button_area[idx].width),
+-            height: button_area[idx].height,
+-        };
+-        frame.render_widget(Paragraph::new(label.as_str()).style(style), text_rect);
+-    }
++                .add_modifier(Modifier::BOLD),
++        ),
++        Span::styled(" ▶", Style::default().fg(Color::White)),
++    ]);
++    frame.render_widget(Paragraph::new(time_line), rows[0]);
++
++    let rated_line = Line::from(vec![
++        Span::styled("Mode  ", Style::default().fg(Color::Cyan)),
++        Span::styled(
++            "Rated",
++            Style::default()
++                .fg(Color::Yellow)
++                .add_modifier(Modifier::BOLD),
++        ),
++    ]);
++    frame.render_widget(Paragraph::new(rated_line), rows[1]);
+ }
+ 
+ fn render_menu_panel(frame: &mut Frame, app: &App, area: Rect) {
+@@ -170,6 +164,7 @@ fn render_menu_panel(frame: &mut Frame, app: &App, area: Rect) {
          ("Puzzle", "Play a puzzle"),
          ("My Ongoing Games", "View and join your current games"),
          ("Join by Code", "Enter a game code to join"),
@@ -1105,7 +2082,7 @@ index f303480..9301b0e 100644
          ("Disconnect", "Remove Lichess token and logout"),
      ];
  
-@@ -177,7 +178,7 @@ fn render_menu_panel(frame: &mut Frame, app: &App, area: Rect) {
+@@ -177,7 +172,7 @@ fn render_menu_panel(frame: &mut Frame, app: &App, area: Rect) {
  
      for (idx, (option, description)) in menu_items.iter().enumerate() {
          let is_selected = app.ui_state.menu_cursor == idx as u8;
@@ -1114,7 +2091,7 @@ index f303480..9301b0e 100644
  
          let style = if is_selected {
              if is_disconnect {
-@@ -505,12 +506,15 @@ fn render_user_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
+@@ -505,12 +500,15 @@ fn render_user_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
              columns[2],
          );
      } else {
@@ -1135,12 +2112,87 @@ index f303480..9301b0e 100644
              inner_area,
          );
      }
+diff --git a/src/ui/popup/end.rs b/src/ui/popup/end.rs
+index c2e0755..8b86d9b 100644
+--- a/src/ui/popup/end.rs
++++ b/src/ui/popup/end.rs
+@@ -57,6 +57,13 @@ pub fn render_end_popup(frame: &mut Frame, sentence: &str, is_lichess: bool) {
+                 .alignment(Alignment::Center)
+                 .style(Style::default().fg(Color::LightGreen)),
+         );
++    } else {
++        text.push(Line::from(""));
++        text.push(
++            Line::from("Press `R` to request a rematch")
++                .alignment(Alignment::Center)
++                .style(Style::default().fg(Color::LightGreen)),
++        );
+     }
+ 
+     text.push(Line::from(""));
+diff --git a/src/ui/popup/lichess/draw_menu.rs b/src/ui/popup/lichess/draw_menu.rs
+new file mode 100644
+index 0000000..94585a7
+--- /dev/null
++++ b/src/ui/popup/lichess/draw_menu.rs
+@@ -0,0 +1,51 @@
++//! Draw options popup for the active Lichess game.
++
++use crate::{app::App, constants::WHITE, ui::components::centered_rect::centered_rect};
++use ratatui::{
++    Frame,
++    layout::Alignment,
++    style::{Color, Modifier, Style},
++    text::Line,
++    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
++};
++
++/// Renders the draw options (offer/accept, decline, claim) for the active game.
++pub fn render_draw_menu_popup(frame: &mut Frame, app: &App) {
++    let block = Block::default()
++        .title("Draw")
++        .borders(Borders::ALL)
++        .border_type(BorderType::Rounded)
++        .padding(Padding::horizontal(1))
++        .border_style(Style::default().fg(WHITE));
++    let area = centered_rect(52, 40, frame.area());
++
++    let mut text: Vec<Line> = Vec::new();
++
++    if app.lichess_state.draw_offer_pending {
++        text.push(
++            Line::from("Your opponent has offered a draw.")
++                .alignment(Alignment::Center)
++                .style(
++                    Style::default()
++                        .fg(Color::Yellow)
++                        .add_modifier(Modifier::BOLD),
++                ),
++        );
++        text.push(Line::from(""));
++    }
++
++    text.push(Line::from("  o — Offer a draw / accept their offer"));
++    text.push(Line::from("  n — Decline their draw offer"));
++    text.push(Line::from("  c — Claim a draw (50-move / repetition)"));
++    text.push(Line::from(""));
++    text.push(Line::from("  Esc — Cancel").alignment(Alignment::Center));
++
++    let paragraph = Paragraph::new(text)
++        .block(block.clone())
++        .alignment(Alignment::Left)
++        .wrap(Wrap { trim: true });
++
++    frame.render_widget(Clear, area);
++    frame.render_widget(block, area);
++    frame.render_widget(paragraph, area);
++}
 diff --git a/src/ui/popup/lichess/host_game.rs b/src/ui/popup/lichess/host_game.rs
 new file mode 100644
-index 0000000..988b079
+index 0000000..4b4b06a
 --- /dev/null
 +++ b/src/ui/popup/lichess/host_game.rs
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,181 @@
 +//! Popups for hosting a private Lichess game (open challenge).
 +
 +use crate::{
@@ -1158,23 +2210,38 @@ index 0000000..988b079
 +
 +/// Renders the time-control picker for a hosted Lichess game.
 +pub fn render_host_game_popup(frame: &mut Frame, app: &App) {
++    let title = if app.lichess_state.rematch_target.is_some() {
++        "Rematch"
++    } else {
++        "Host a Lichess Game"
++    };
 +    let block = Block::default()
-+        .title("Host a Lichess Game")
++        .title(title)
 +        .borders(Borders::ALL)
 +        .border_type(BorderType::Rounded)
 +        .padding(Padding::horizontal(1))
 +        .border_style(Style::default().fg(WHITE));
 +    let area = centered_rect(60, 80, frame.area());
 +
-+    let mut text = vec![
-+        Line::from("Create a private casual game, then share its code/link.")
-+            .alignment(Alignment::Center),
-+        Line::from("Your opponent joins with Lichess → Join by Code.")
-+            .alignment(Alignment::Center),
++    let mut text = match &app.lichess_state.rematch_target {
++        Some(target) => vec![
++            Line::from(format!("Send a rematch challenge to {}.", target))
++                .alignment(Alignment::Center),
++            Line::from("They can accept it on Lichess or in chess-tui.")
++                .alignment(Alignment::Center),
++        ],
++        None => vec![
++            Line::from("Create a private game, then share its code/link.")
++                .alignment(Alignment::Center),
++            Line::from("Your opponent joins with Lichess → Join by Code.")
++                .alignment(Alignment::Center),
++        ],
++    };
++    text.extend(vec![
 +        Line::from(""),
 +        Line::from("Choose a time control:"),
 +        Line::from(""),
-+    ];
++    ]);
 +
 +    for (idx, (label, _, _)) in LICHESS_HOST_TIME_CONTROLS.iter().enumerate() {
 +        let selected = idx as u8 == app.lichess_state.host_game_cursor;
@@ -1194,7 +2261,43 @@ index 0000000..988b079
 +    }
 +
 +    text.push(Line::from(""));
-+    text.push(Line::from("↑/↓ Select   Enter Create   Esc Cancel"));
++    let mode = if app.lichess_state.host_rated {
++        "Rated"
++    } else {
++        "Casual"
++    };
++    text.push(Line::from(vec![
++        Span::styled("Mode:  ", Style::default().fg(Color::Cyan)),
++        Span::styled(
++            mode,
++            Style::default()
++                .fg(Color::Black)
++                .bg(Color::White)
++                .add_modifier(Modifier::BOLD),
++        ),
++        Span::raw("   (press r to toggle)"),
++    ]));
++
++    let color = match app.lichess_state.host_color {
++        crate::state::lichess_state::HostColor::White => "White",
++        crate::state::lichess_state::HostColor::Black => "Black",
++        crate::state::lichess_state::HostColor::Random => "Random",
++    };
++    text.push(Line::from(vec![
++        Span::styled("Color: ", Style::default().fg(Color::Cyan)),
++        Span::styled(
++            color,
++            Style::default()
++                .fg(Color::Black)
++                .bg(Color::White)
++                .add_modifier(Modifier::BOLD),
++        ),
++        Span::raw("   (press c to cycle)"),
++    ]));
++    text.push(Line::from(""));
++    text.push(Line::from(
++        "↑/↓ Select   r Rated/Casual   c Color   Enter Create   Esc Cancel",
++    ));
 +
 +    let paragraph = Paragraph::new(text)
 +        .block(block.clone())
@@ -1220,9 +2323,21 @@ index 0000000..988b079
 +    let mut text: Vec<Line> = Vec::new();
 +
 +    if let Some((id, url)) = &app.lichess_state.host_challenge {
-+        text.push(Line::from(
-+            "Open challenge created! Share this with your opponent:",
-+        ));
++        let mode = if app.lichess_state.host_rated {
++            "rated"
++        } else {
++            "casual"
++        };
++        match &app.lichess_state.rematch_target {
++            Some(target) => text.push(Line::from(format!(
++                "Rematch challenge ({}) sent to {}!",
++                mode, target
++            ))),
++            None => text.push(Line::from(format!(
++                "Open challenge created ({})! Share this with your opponent:",
++                mode
++            ))),
++        }
 +        text.push(Line::from(""));
 +        text.push(Line::from(vec![
 +            Span::raw("  Code:  "),
@@ -1260,12 +2375,13 @@ index 0000000..988b079
 +    frame.render_widget(paragraph, area);
 +}
 diff --git a/src/ui/popup/lichess/mod.rs b/src/ui/popup/lichess/mod.rs
-index df7ab6d..793d3a6 100644
+index df7ab6d..174d3a7 100644
 --- a/src/ui/popup/lichess/mod.rs
 +++ b/src/ui/popup/lichess/mod.rs
-@@ -1,5 +1,7 @@
+@@ -1,5 +1,8 @@
  //! Lichess popup overlays.
  
++pub mod draw_menu;
  pub mod game_code;
 +pub mod host_game;
  pub mod puzzle_end;
@@ -1338,3 +2454,82 @@ index 0000000..39f0cbf
 +    frame.render_widget(block, area);
 +    frame.render_widget(paragraph, area);
 +}
+diff --git a/src/ui/popup/resignation.rs b/src/ui/popup/resignation.rs
+index 7216f1c..ca0ffdd 100644
+--- a/src/ui/popup/resignation.rs
++++ b/src/ui/popup/resignation.rs
+@@ -11,31 +11,50 @@ use ratatui::{
+ 
+ /// Renders a "Yes / No" confirmation dialog before resigning the current game.
+ pub fn render_resign_confirmation_popup(frame: &mut Frame, app: &App) {
++    // When a Lichess game is open on the board, this popup targets it.
++    let active_game = app
++        .game
++        .logic
++        .opponent
++        .as_ref()
++        .is_some_and(|o| o.is_lichess());
++
++    let (title, headline) = if active_game {
++        if app.active_lichess_game_has_no_moves() {
++            ("Abort Game", "Abort this game? (no moves played)".to_string())
++        } else {
++            (
++                "Resign Game",
++                "Are you sure you want to resign this game?".to_string(),
++            )
++        }
++    } else {
++        let opponent_name = if let Some(game) = app
++            .lichess_state
++            .ongoing_games
++            .get(app.ui_state.menu_cursor as usize)
++        {
++            format!("vs {}", game.opponent.username)
++        } else {
++            "this game".to_string()
++        };
++        (
++            "Resign Game",
++            format!("Are you sure you want to resign {}?", opponent_name),
++        )
++    };
++
+     let block = Block::default()
+-        .title("Resign Game")
++        .title(title)
+         .borders(Borders::ALL)
+         .border_type(BorderType::Rounded)
+         .padding(Padding::horizontal(1))
+         .border_style(Style::default().fg(WHITE));
+     let area = centered_rect(50, 30, frame.area());
+ 
+-    let opponent_name = if let Some(game) = app
+-        .lichess_state
+-        .ongoing_games
+-        .get(app.ui_state.menu_cursor as usize)
+-    {
+-        format!("vs {}", game.opponent.username)
+-    } else {
+-        "this game".to_string()
+-    };
+-
+     let text = vec![
+         Line::from(""),
+-        Line::from(format!(
+-            "Are you sure you want to resign {}?",
+-            opponent_name
+-        ))
+-        .alignment(Alignment::Center),
++        Line::from(headline).alignment(Alignment::Center),
+         Line::from(""),
+         Line::from("This action cannot be undone.").alignment(Alignment::Center),
+         Line::from(""),
+diff --git a/target b/target
+new file mode 120000
+index 0000000..f7fcdd8
+--- /dev/null
++++ b/target
+@@ -0,0 +1 @@
++/home/adam/.cache/ct-target
+\ No newline at end of file
