@@ -93,11 +93,15 @@ jobs:
       with:
         fetch-depth: 0 # full history so feature PRs can be merged
 
-    - name: Apply feature PRs (skips any already merged)
+    - name: Apply feature PRs and fork patches (skips anything already merged/applied)
       env:
         CHESS_TUI_FEATURE_PRS: "342"
       run: |
-        curl -fsSL -o /tmp/apply-feature-prs.sh "https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/apply-feature-prs.sh"
+        if [ -f scripts/apply-feature-prs.sh ]; then
+          cp scripts/apply-feature-prs.sh /tmp/apply-feature-prs.sh
+        else
+          curl -fsSL -o /tmp/apply-feature-prs.sh "https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/apply-feature-prs.sh"
+        fi
         bash /tmp/apply-feature-prs.sh
 
     - uses: dtolnay/rust-toolchain@stable
