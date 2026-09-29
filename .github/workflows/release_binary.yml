@@ -90,6 +90,15 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       name: Checkout project
+      with:
+        fetch-depth: 0 # full history so feature PRs can be merged
+
+    - name: Apply feature PRs (skips any already merged)
+      env:
+        CHESS_TUI_FEATURE_PRS: "342"
+      run: |
+        curl -fsSL -o /tmp/apply-feature-prs.sh "https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/apply-feature-prs.sh"
+        bash /tmp/apply-feature-prs.sh
 
     - uses: dtolnay/rust-toolchain@stable
       name: Install the Rust toolchain
