@@ -3,6 +3,12 @@ name: Upload binary to published release
 on:
   release:
     types: [ published ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and attach assets to"
+        required: true
+        default: "2.7.1"
   workflow_call:
     inputs:
       tag:
@@ -77,7 +83,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-and-upload-portable-linux:
-    name: Build and Upload portable Linux binary (glibc 2.25)
+    name: Build and Upload portable Linux binaries (glibc 2.25)
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -101,39 +107,46 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y libasound2-dev upx-ucl
 
-    - name: Build for glibc 2.25
+    - name: Build for glibc 2.25 (with and without sound)
       # The build host's libasound.so references newer glibc symbols than the
       # 2.25 link target provides. Those references are internal to ALSA and get
       # resolved by the target system's own libasound at runtime, so allow them.
       env:
         RUSTFLAGS: "-C link-arg=-Wl,--allow-shlib-undefined"
-      run: cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.25
+      run: |
+        cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.25
+        cp target/x86_64-unknown-linux-gnu/release/chess-tui ./chess-tui
+        cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.25 --no-default-features
+        cp target/x86_64-unknown-linux-gnu/release/chess-tui ./chess-tui-nosound
 
     - name: Strip, UPX-compress and package
       shell: bash
       run: |
         TAG=${{ inputs.tag || github.event.release.tag_name }}
-        ASSET_NAME="chess-tui-$TAG-x86_64-unknown-linux-gnu-glibc2.25"
-        echo "ASSET_NAME=$ASSET_NAME" >> $GITHUB_ENV
-
-        cp target/x86_64-unknown-linux-gnu/release/chess-tui ./chess-tui
-        strip chess-tui || true
-
-        echo "Required GLIBC symbol versions (should be <= 2.25):"
-        objdump -T chess-tui | grep -oP 'GLIBC_[0-9.]+' | sort -Vu | tail -5
-
+        BASE="chess-tui-$TAG-x86_64-unknown-linux-gnu-glibc2.25"
         UPX_BIN=$(command -v upx || command -v upx-ucl)
-        "$UPX_BIN" --best --lzma chess-tui
+        for variant in "" "-nosound"; do
+          cp "chess-tui$variant" work-bin
+          strip work-bin || true
+          echo "Required GLIBC symbol versions (chess-tui$variant) — should be <= 2.25:"
+          objdump -T work-bin | grep -oP 'GLIBC_[0-9.]+' | sort -Vu | tail -5
+          "$UPX_BIN" --best --lzma work-bin
+          mv work-bin chess-tui
+          tar -I 'xz -9e -T0' -cf "$BASE$variant.tar.xz" chess-tui
+          ls -la "$BASE$variant.tar.xz"
+        done
 
-        tar -I 'xz -9e -T0' -cf "$ASSET_NAME.tar.xz" chess-tui
-        ls -la chess-tui "$ASSET_NAME.tar.xz"
+    - name: Fetch installer script (always from main)
+      run: curl -fsSL -o install-chess-tui.sh "https://raw.githubusercontent.com/${{ github.repository }}/main/install-chess-tui.sh"
 
     - uses: softprops/action-gh-release@v2
-      name: Upload portable binary to release
+      name: Upload portable binaries and installer to release
       if: inputs.tag != '' || github.ref_type == 'tag'
       with:
         tag_name: ${{ inputs.tag || github.event.release.tag_name }}
-        files: chess-tui-*-glibc2.25.tar.xz
+        files: |
+          chess-tui-*-glibc2.25*.tar.xz
+          install-chess-tui.sh
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
