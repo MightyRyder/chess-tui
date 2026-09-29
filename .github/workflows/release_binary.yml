@@ -133,6 +133,199 @@ jobs:
           "$UPX_BIN" --best --lzma work-bin
           mv work-bin chess-tui
           tar -I 'xz -9e -T0' -cf "$BASE$variant.tar.xz" chess-tui
+          sha256sum "$BASE$variant.tar.xz" > "$BASE$variant.tar.xz.sha256"
+          ls -la "$BASE$variant.tar.xz" "$BASE$variant.tar.xz.sha256"
+        done
+
+    - name: Fetch installer script (always from main)
+      run: curl -fsSL -o install-chess-tui.sh "https://raw.githubusercontent.com/${{ github.repository }}/main/install-chess-tui.sh"
+
+    - uses: softprops/action-gh-release@v2
+      name: Upload portable binaries and installer to release
+      if: inputs.tag != '' || github.ref_type == 'tag'
+      with:
+        tag_name: ${{ inputs.tag || github.event.release.tag_name }}
+        files: |
+          chess-tui-*-glibc2.25*.tar.xz
+          chess-tui-*-glibc2.25*.tar.xz.sha256
+          install-chess-tui.sh
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-and-upload-deb:
+    name: Build and Upload Debian package
+    runs-on: ubuntu-latest
+    needs: build-and-upload-binary
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+      name: Checkout project
+
+    - uses: dtolnay/rust-toolchain@stable
+      name: Install the Rust toolchain
+
+    - name: Install ALSA development libraries
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+    - name: Install cargo-deb
+      run: cargo install cargo-deb
+
+    - uses: Swatinem/rust-cache@v2
+      name: Use cached dependencies and artifacts
+
+    - name: Build Debian package
+      run: cargo deb
+
+    - name: Find generated .deb
+      id: find_deb
+      run: |
+        DEB_PATH=$(find target/debian -name "*.deb" | head -n 1)
+        echo "deb_path=$DEB_PATH" >> "$GITHUB_OUTPUT"
+
+    - uses: softprops/action-gh-release@v2
+      name: Upload .deb to release
+      if: inputs.tag != '' || github.ref_type == 'tag'
+      with:
+        tag_name: ${{ inputs.tag || github.event.release.tag_name }}
+        files: ${{ steps.find_deb.outputs.deb_path }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+name: Upload binary to published release
+
+on:
+  release:
+    types: [ published ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and attach assets to"
+        required: true
+        default: "2.7.1"
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+
+jobs:
+  build-and-upload-binary:
+    name: Build and Upload Binary to release
+    strategy:
+      matrix:
+        include:
+        - { os: "macos-latest", target: "aarch64-apple-darwin" }
+        - { os: "macos-15-intel", target: "x86_64-apple-darwin" }
+        - { os: "ubuntu-latest", target: "x86_64-unknown-linux-gnu" }
+        - { os: "ubuntu-24.04-arm", target: "aarch64-unknown-linux-gnu" }
+        - { os: "windows-latest", target: "x86_64-pc-windows-msvc", ext: ".exe" }
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+      name: Checkout project
+
+    - uses: dtolnay/rust-toolchain@stable
+      name: Install the Rust toolchain
+      # note: would require setting `targets` if `matrix.target` wasn't host-default
+
+    - name: Install ALSA development libraries (Linux/Unix only)
+      if: runner.os == 'Linux' || runner.os == 'Unix'
+      run: |
+        if command -v apt-get &> /dev/null; then
+          sudo apt-get update && sudo apt-get install -y libasound2-dev
+        elif command -v dnf &> /dev/null; then
+          sudo dnf install -y alsa-lib-devel
+        elif command -v yum &> /dev/null; then
+          sudo yum install -y alsa-lib-devel
+        elif command -v pacman &> /dev/null; then
+          sudo pacman -S --noconfirm alsa-lib
+        elif command -v zypper &> /dev/null; then
+          sudo zypper install -y alsa-devel
+        elif command -v pkg_add &> /dev/null; then
+          sudo pkg_add alsa-lib || pkg_add alsa-lib
+        else
+          echo "Unknown package manager, skipping ALSA installation"
+        fi
+
+    - uses: Swatinem/rust-cache@v2
+      name: Use cached dependencies and artifacts
+
+    - run: cargo build --release --target ${{ matrix.target }}
+      name: Build release binary
+
+    - run: |
+        TAG=${{ inputs.tag || github.event.release.tag_name }}
+        TAR_NAME="chess-tui-$TAG-${{ matrix.target }}.tar.gz"
+        echo "TAR_NAME=$TAR_NAME" >> $GITHUB_ENV
+
+        EXE_NAME="chess-tui${{ matrix.ext }}"
+        cp "target/${{ matrix.target }}/release/$EXE_NAME" .
+        tar -czvf "$TAR_NAME" ./chess-tui
+      shell: bash # needed for windows
+      name: Set TAR_NAME from tag and platform, create tar file containing the binary
+
+    - uses: softprops/action-gh-release@v2
+      name: Upload binary to release
+      if: inputs.tag != '' || github.ref_type == 'tag'
+      with:
+        tag_name: ${{ inputs.tag || github.event.release.tag_name }}
+        files: ${{ env.TAR_NAME }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-and-upload-portable-linux:
+    name: Build and Upload portable Linux binaries (glibc 2.25)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+      name: Checkout project
+
+    - uses: dtolnay/rust-toolchain@stable
+      name: Install the Rust toolchain
+
+    - uses: mlugg/setup-zig@v2
+      name: Install Zig
+      with:
+        version: "0.16.0"
+
+    - name: Install cargo-zigbuild
+      run: cargo install --locked cargo-zigbuild
+
+    - name: Install ALSA development libraries and UPX
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libasound2-dev upx-ucl
+
+    - name: Build for glibc 2.25 (with and without sound)
+      # The build host's libasound.so references newer glibc symbols than the
+      # 2.25 link target provides. Those references are internal to ALSA and get
+      # resolved by the target system's own libasound at runtime, so allow them.
+      env:
+        RUSTFLAGS: "-C link-arg=-Wl,--allow-shlib-undefined"
+      run: |
+        cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.25
+        cp target/x86_64-unknown-linux-gnu/release/chess-tui ./chess-tui
+        cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.25 --no-default-features
+        cp target/x86_64-unknown-linux-gnu/release/chess-tui ./chess-tui-nosound
+
+    - name: Strip, UPX-compress and package
+      shell: bash
+      run: |
+        TAG=${{ inputs.tag || github.event.release.tag_name }}
+        BASE="chess-tui-$TAG-x86_64-unknown-linux-gnu-glibc2.25"
+        UPX_BIN=$(command -v upx || command -v upx-ucl)
+        for variant in "" "-nosound"; do
+          cp "chess-tui$variant" work-bin
+          strip work-bin || true
+          echo "Required GLIBC symbol versions (chess-tui$variant) — should be <= 2.25:"
+          objdump -T work-bin | grep -oP 'GLIBC_[0-9.]+' | sort -Vu | tail -5
+          "$UPX_BIN" --best --lzma work-bin
+          mv work-bin chess-tui
+          tar -I 'xz -9e -T0' -cf "$BASE$variant.tar.xz" chess-tui
           ls -la "$BASE$variant.tar.xz"
         done
 
